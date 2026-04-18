@@ -175,9 +175,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
+    // Восстановление иконки при перезапуске проводника
+    static UINT uTaskbarRestart = RegisterWindowMessageW(L"TaskbarCreated");
+    if (message == uTaskbarRestart) {
+        AddTrayIcon(hWnd);
+        return 0;
     }
-    return 0;
+    return DefWindowProc(hWnd, message, wParam, lParam);
+}
+return 0;
 }
 
 // Главная функция
