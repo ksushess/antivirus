@@ -2,7 +2,7 @@ name: Build Windows App
 
 on:
   push:
-    branches: [ main, number2 ]
+    branches: [ main, number2, number3 ]
   pull_request:
 
 jobs:
