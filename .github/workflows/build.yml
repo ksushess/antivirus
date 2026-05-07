@@ -2,24 +2,25 @@ name: Build Windows App
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, number2 ]
+  pull_request:
 
 jobs:
   build:
     runs-on: windows-latest
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-    
-    - name: Configure CMake
-      run: cmake -B build -DCMAKE_BUILD_TYPE=Release
-    
-    - name: Build
-      run: cmake --build build --config Release
-    
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: antivirus
-        path: build/Release/antivirus.exe
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: antivirus-binaries
+          path: build/Release/*.exe

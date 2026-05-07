@@ -1,0 +1,42 @@
+[
+    uuid(3644e25e-9e69-4647-a5ec-8f6d39c3f720),
+    version(1.0),
+    implicit_handle(handle_t AntivirusBinding)
+]
+interface AntivirusRpc
+{
+    void RequestServiceStop(void);
+    long GetAuthenticationState(
+        [out] long* isAuthenticated,
+        [in] long usernameCapacity,
+        [out, string, size_is(usernameCapacity)] wchar_t* username,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long LoginUser(
+        [string, in] wchar_t* username,
+        [string, in] wchar_t* password,
+        [out] long* isAuthenticated,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long LogoutUser(
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long GetLicenseState(
+        [out] long* licenseState,
+        [in] long expirationCapacity,
+        [out, string, size_is(expirationCapacity)] wchar_t* expirationDate,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long ActivateProduct(
+        [string, in] wchar_t* activationCode,
+        [out] long* licenseState,
+        [in] long expirationCapacity,
+        [out, string, size_is(expirationCapacity)] wchar_t* expirationDate,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+}

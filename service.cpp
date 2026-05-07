@@ -1,10 +1,14 @@
-#include <windows.h>
+﻿#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <aclapi.h>
+#include <iphlpapi.h>
 #include <sddl.h>
 #include <wtsapi32.h>
 #include <userenv.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -14,8 +18,10 @@
 #include "antivirus_rpc.h"
 #include "rpc_client.h"
 #include "shared.h"
+#include "ziopvo_client.h"
 
 namespace {
+
 
 struct SessionProcess {
     HANDLE processHandle = nullptr;
@@ -33,6 +39,35 @@ std::wstring g_trayApplicationPath;
 std::mutex g_processMutex;
 std::map<DWORD, SessionProcess> g_sessionProcesses;
 std::atomic<bool> g_stopRequested(false);
+
+std::mutex g_authMutex;
+std::wstring g_authenticatedUsername;
+std::wstring g_authenticatedEmail;
+std::wstring g_authenticatedRole;
+std::string g_accessToken;
+std::string g_refreshToken;
+std::chrono::system_clock::time_point g_accessTokenExpiry = {};
+std::chrono::system_clock::time_point g_refreshTokenExpiry = {};
+long g_lastAuthResult = antivirus::kRpcResultNotAuthenticated;
+std::wstring g_lastAuthMessage = L"User is not authenticated.";
+
+HANDLE g_authStopEvent = nullptr;
+HANDLE g_authWakeEvent = nullptr;
+HANDLE g_authWorkerThread = nullptr;
+
+std::wstring g_deviceName;
+std::wstring g_deviceMac;
+antivirus::LicenseTicket g_licenseTicket;
+bool g_hasLicenseTicket = false;
+long g_licenseState = antivirus::kLicenseStateMissing;
+std::wstring g_licenseMessage = L"No active license.";
+std::chrono::system_clock::time_point g_licenseRefreshDeadline = {};
+
+void StopAllTrayApplications();
+void StopRpcServer();
+bool StartAuthWorker();
+void StopAuthWorker();
+void ClearLicenseStateLocked(long state, const std::wstring& message);
 
 std::wstring GetModulePath() {
     wchar_t buffer[MAX_PATH] = {};
@@ -56,6 +91,341 @@ std::wstring QuoteForCommandLine(const std::wstring& path) {
 bool FileExists(const std::wstring& path) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring FormatMacAddress(const BYTE* address, ULONG length) {
+    if (!address || length == 0) {
+        return L"";
+    }
+
+    wchar_t segment[4] = {};
+    std::wstring result;
+    for (ULONG index = 0; index < length; ++index) {
+        if (!result.empty()) {
+            result += L":";
+        }
+
+        swprintf_s(segment, L"%02X", address[index]);
+        result += segment;
+    }
+
+    return result;
+}
+
+std::wstring DetectPrimaryMacAddress() {
+    ULONG bufferSize = 0;
+    GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, nullptr, &bufferSize);
+    if (bufferSize == 0) {
+        return L"";
+    }
+
+    std::vector<BYTE> buffer(bufferSize);
+    auto* addresses = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+    if (GetAdaptersAddresses(
+            AF_UNSPEC,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            nullptr,
+            addresses,
+            &bufferSize) != NO_ERROR) {
+        return L"";
+    }
+
+    for (IP_ADAPTER_ADDRESSES* adapter = addresses; adapter != nullptr; adapter = adapter->Next) {
+        if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK ||
+            adapter->OperStatus != IfOperStatusUp ||
+            adapter->PhysicalAddressLength == 0) {
+            continue;
+        }
+
+        return FormatMacAddress(adapter->PhysicalAddress, adapter->PhysicalAddressLength);
+    }
+
+    return L"";
+}
+
+std::wstring DetectDeviceName() {
+    wchar_t buffer[MAX_COMPUTERNAME_LENGTH + 1] = {};
+    DWORD size = static_cast<DWORD>(std::size(buffer));
+    if (GetComputerNameW(buffer, &size)) {
+        return buffer;
+    }
+
+    return L"Windows Device";
+}
+
+void CopyRpcText(const std::wstring& source, long capacity, wchar_t* target) {
+    if (!target || capacity <= 0) {
+        return;
+    }
+
+    target[0] = L'\0';
+    wcsncpy_s(target, static_cast<size_t>(capacity), source.c_str(), _TRUNCATE);
+}
+
+long MapBackendStatusToRpcResult(const antivirus::BackendCallStatus& status, bool authenticationRequest) {
+    if (status.transportError != 0) {
+        return antivirus::kRpcResultTransportError;
+    }
+
+    if (status.httpStatus == 0 || status.httpStatus >= 500) {
+        return antivirus::kRpcResultBackendUnavailable;
+    }
+
+    if (status.httpStatus == 400) {
+        return authenticationRequest ? antivirus::kRpcResultInvalidCredentials : antivirus::kRpcResultUnexpectedResponse;
+    }
+
+    if (status.httpStatus == 401 || status.httpStatus == 403) {
+        return authenticationRequest ? antivirus::kRpcResultInvalidCredentials : antivirus::kRpcResultNotAuthenticated;
+    }
+
+    return antivirus::kRpcResultUnexpectedResponse;
+}
+
+void ClearAuthenticationStateLocked(const std::wstring& message, long resultCode) {
+    g_authenticatedUsername.clear();
+    g_authenticatedEmail.clear();
+    g_authenticatedRole.clear();
+    g_accessToken.clear();
+    g_refreshToken.clear();
+    g_accessTokenExpiry = {};
+    g_refreshTokenExpiry = {};
+    g_lastAuthResult = resultCode;
+    g_lastAuthMessage = message;
+    ClearLicenseStateLocked(antivirus::kLicenseStateMissing, L"No active license.");
+}
+
+void StoreAuthenticatedStateLocked(
+    const antivirus::UserProfile& profile,
+    const antivirus::TokenBundle& tokens
+) {
+    g_authenticatedUsername = profile.username;
+    g_authenticatedEmail = profile.email;
+    g_authenticatedRole = profile.role;
+    g_accessToken = tokens.accessToken;
+    g_refreshToken = tokens.refreshToken;
+    g_accessTokenExpiry = tokens.accessExpiry;
+    g_refreshTokenExpiry = tokens.refreshExpiry;
+    g_lastAuthResult = antivirus::kRpcResultOk;
+    g_lastAuthMessage.clear();
+    ClearLicenseStateLocked(antivirus::kLicenseStateMissing, L"No active license.");
+}
+
+void WakeAuthWorker() {
+    if (g_authWakeEvent) {
+        SetEvent(g_authWakeEvent);
+    }
+}
+
+bool IsRefreshFailureFinal(const antivirus::BackendCallStatus& status) {
+    return status.httpStatus == 400 || status.httpStatus == 401 || status.httpStatus == 403 || status.httpStatus == 404;
+}
+
+bool IsAuthenticatedLocked() {
+    return !g_accessToken.empty() && !g_refreshToken.empty() && !g_authenticatedUsername.empty();
+}
+
+void ClearLicenseStateLocked(long state, const std::wstring& message) {
+    g_licenseTicket = {};
+    g_hasLicenseTicket = false;
+    g_licenseState = state;
+    g_licenseMessage = message;
+    g_licenseRefreshDeadline = {};
+}
+
+bool ParseBackendLicenseState(const std::wstring& message, long* state, std::wstring* normalizedMessage) {
+    if (normalizedMessage) {
+        *normalizedMessage = message;
+    }
+
+    if (message.find(L"License is blocked") != std::wstring::npos) {
+        if (state) {
+            *state = antivirus::kLicenseStateBlocked;
+        }
+        return true;
+    }
+
+    if (message.find(L"License has expired") != std::wstring::npos) {
+        if (state) {
+            *state = antivirus::kLicenseStateExpired;
+        }
+        return true;
+    }
+
+    if (message.find(L"No active license found") != std::wstring::npos ||
+        message.find(L"Device not found") != std::wstring::npos ||
+        message.find(L"License is not activated yet") != std::wstring::npos ||
+        message.find(L"License not bound to this user") != std::wstring::npos) {
+        if (state) {
+            *state = antivirus::kLicenseStateMissing;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+std::chrono::system_clock::time_point ComputeLicenseRefreshDeadline(const antivirus::LicenseTicket& ticket) {
+    if (ticket.currentTime == std::chrono::system_clock::time_point() ||
+        ticket.lifetime <= std::chrono::minutes::zero()) {
+        return {};
+    }
+
+    std::chrono::system_clock::time_point deadline = ticket.currentTime + ticket.lifetime - std::chrono::minutes(5);
+    if (ticket.expirationTime != std::chrono::system_clock::time_point()) {
+        const auto expiryDeadline = ticket.expirationTime - std::chrono::minutes(1);
+        if (deadline == std::chrono::system_clock::time_point() || expiryDeadline < deadline) {
+            deadline = expiryDeadline;
+        }
+    }
+
+    return deadline;
+}
+
+void StoreLicenseTicketLocked(const antivirus::LicenseTicket& ticket) {
+    g_licenseTicket = ticket;
+    g_hasLicenseTicket = true;
+    g_licenseState = ticket.blocked ? antivirus::kLicenseStateBlocked : antivirus::kLicenseStateActive;
+    g_licenseMessage.clear();
+    g_licenseRefreshDeadline = ComputeLicenseRefreshDeadline(ticket);
+}
+
+bool IsLicenseRefreshDueLocked() {
+    if (!g_hasLicenseTicket || g_licenseState != antivirus::kLicenseStateActive) {
+        return false;
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    if (g_licenseTicket.expirationTime != std::chrono::system_clock::time_point() &&
+        g_licenseTicket.expirationTime <= now) {
+        return true;
+    }
+
+    return g_licenseRefreshDeadline == std::chrono::system_clock::time_point() ||
+           g_licenseRefreshDeadline <= now;
+}
+
+void SnapshotLicenseOutputsLocked(long* licenseState, std::wstring* expirationDate, std::wstring* message) {
+    if (licenseState) {
+        *licenseState = g_licenseState;
+    }
+    if (expirationDate) {
+        *expirationDate = g_hasLicenseTicket ? g_licenseTicket.expirationDate : L"";
+    }
+    if (message) {
+        *message = g_licenseMessage;
+    }
+}
+
+long RefreshLicenseStateFromBackend(bool forceRefresh) {
+    std::string accessToken;
+    std::wstring deviceMac;
+
+    {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        if (!IsAuthenticatedLocked()) {
+            return antivirus::kRpcResultNotAuthenticated;
+        }
+
+        if (!forceRefresh && g_hasLicenseTicket && !IsLicenseRefreshDueLocked()) {
+            return antivirus::kRpcResultOk;
+        }
+
+        accessToken = g_accessToken;
+        deviceMac = g_deviceMac;
+    }
+
+    const antivirus::LicenseTicketResponse licenseResponse = antivirus::BackendCheckLicense(accessToken, deviceMac);
+    if (licenseResponse.status.success && licenseResponse.hasTicket) {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        if (g_accessToken == accessToken) {
+            StoreLicenseTicketLocked(licenseResponse.ticket);
+        }
+        return antivirus::kRpcResultOk;
+    }
+
+    long parsedState = antivirus::kLicenseStateUnknown;
+    std::wstring parsedMessage;
+    if (ParseBackendLicenseState(licenseResponse.status.message, &parsedState, &parsedMessage)) {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        if (g_accessToken == accessToken) {
+            ClearLicenseStateLocked(parsedState, parsedMessage);
+        }
+        return antivirus::kRpcResultOk;
+    }
+
+    const long resultCode = MapBackendStatusToRpcResult(licenseResponse.status, false);
+    if (resultCode == antivirus::kRpcResultNotAuthenticated) {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        if (g_accessToken == accessToken) {
+            const std::wstring message = licenseResponse.status.message.empty()
+                ? L"Session expired. Please sign in again."
+                : licenseResponse.status.message;
+            ClearAuthenticationStateLocked(message, antivirus::kRpcResultNotAuthenticated);
+        }
+    }
+
+    return resultCode;
+}
+
+long ActivateLicenseViaBackend(const std::wstring& activationCode) {
+    std::string accessToken;
+    std::wstring deviceMac;
+    std::wstring deviceName;
+
+    {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        if (!IsAuthenticatedLocked()) {
+            return antivirus::kRpcResultNotAuthenticated;
+        }
+
+        accessToken = g_accessToken;
+        deviceMac = g_deviceMac;
+        deviceName = g_deviceName;
+    }
+
+    antivirus::LicenseTicketResponse activationResponse = antivirus::BackendActivateLicense(
+        accessToken,
+        activationCode,
+        deviceName,
+        deviceMac
+    );
+
+    if (activationResponse.status.success) {
+        if (!activationResponse.hasTicket) {
+            return RefreshLicenseStateFromBackend(true);
+        }
+
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        if (g_accessToken == accessToken) {
+            StoreLicenseTicketLocked(activationResponse.ticket);
+        }
+        return antivirus::kRpcResultOk;
+    }
+
+    const long resultCode = MapBackendStatusToRpcResult(activationResponse.status, false);
+    if (resultCode == antivirus::kRpcResultNotAuthenticated) {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        if (g_accessToken == accessToken) {
+            const std::wstring message = activationResponse.status.message.empty()
+                ? L"Session expired. Please sign in again."
+                : activationResponse.status.message;
+            ClearAuthenticationStateLocked(message, antivirus::kRpcResultNotAuthenticated);
+        }
+        return antivirus::kRpcResultNotAuthenticated;
+    }
+
+    std::lock_guard<std::mutex> guard(g_authMutex);
+    if (g_accessToken == accessToken) {
+        const std::wstring message = activationResponse.status.message.empty()
+            ? L"Product activation failed."
+            : activationResponse.status.message;
+        if (g_licenseState == antivirus::kLicenseStateUnknown) {
+            g_licenseState = antivirus::kLicenseStateMissing;
+        }
+        g_licenseMessage = message;
+    }
+    return antivirus::kRpcResultActivationFailed;
 }
 
 void CloseTrackedProcess(SessionProcess& sessionProcess) {
@@ -191,7 +561,7 @@ void LaunchTrayApplicationsForExistingSessions() {
     WTSFreeMemory(sessions);
 }
 
-DWORD WINAPI StopRpcServerThread(LPVOID) {
+DWORD WINAPI StopRpcListeningThread(LPVOID) {
     RpcMgmtStopServerListening(nullptr);
     return 0;
 }
@@ -216,13 +586,184 @@ void StopAllTrayApplications() {
 
     for (SessionProcess& sessionProcess : processes) {
         if (sessionProcess.processHandle) {
-            if (WaitForSingleObject(sessionProcess.processHandle, 5000) == WAIT_TIMEOUT) {
+            if (WaitForSingleObject(sessionProcess.processHandle, 500) == WAIT_TIMEOUT) {
                 TerminateProcess(sessionProcess.processHandle, 0);
-                WaitForSingleObject(sessionProcess.processHandle, 1000);
+                WaitForSingleObject(sessionProcess.processHandle, 2000);
             }
             CloseTrackedProcess(sessionProcess);
         }
     }
+}
+
+DWORD CalculateNextAuthWakeDelayMs() {
+    constexpr DWORD kDefaultDelayMs = 30000;
+
+    std::lock_guard<std::mutex> guard(g_authMutex);
+    const auto now = std::chrono::system_clock::now();
+    bool hasDelay = false;
+    DWORD bestDelay = kDefaultDelayMs;
+
+    if (!g_refreshToken.empty()) {
+        if (g_refreshTokenExpiry <= now || g_accessTokenExpiry == std::chrono::system_clock::time_point()) {
+            return 0;
+        }
+
+        const auto refreshLeadTime = std::chrono::minutes(1);
+        const auto refreshMoment = g_accessTokenExpiry - refreshLeadTime;
+        if (refreshMoment <= now) {
+            return 0;
+        }
+
+        const auto waitDuration = std::chrono::duration_cast<std::chrono::milliseconds>(refreshMoment - now);
+        const auto waitCount = waitDuration.count();
+        if (waitCount <= 0) {
+            return 0;
+        }
+
+        const long long maxDelay = 60LL * 60LL * 1000LL;
+        bestDelay = static_cast<DWORD>(waitCount > maxDelay ? maxDelay : waitCount);
+        hasDelay = true;
+    }
+
+    if (g_hasLicenseTicket && g_licenseState == antivirus::kLicenseStateActive) {
+        if (g_licenseRefreshDeadline == std::chrono::system_clock::time_point() || g_licenseRefreshDeadline <= now) {
+            return 0;
+        }
+
+        const auto waitDuration = std::chrono::duration_cast<std::chrono::milliseconds>(g_licenseRefreshDeadline - now);
+        const auto waitCount = waitDuration.count();
+        if (waitCount <= 0) {
+            return 0;
+        }
+
+        const long long maxDelay = 60LL * 60LL * 1000LL;
+        const DWORD licenseDelay = static_cast<DWORD>(waitCount > maxDelay ? maxDelay : waitCount);
+        if (!hasDelay || licenseDelay < bestDelay) {
+            bestDelay = licenseDelay;
+            hasDelay = true;
+        }
+    }
+
+    return hasDelay ? bestDelay : kDefaultDelayMs;
+}
+
+DWORD WINAPI AuthWorkerThread(LPVOID) {
+    HANDLE waitHandles[] = { g_authStopEvent, g_authWakeEvent };
+
+    while (true) {
+        std::string refreshToken;
+        bool transientRefreshFailure = false;
+        bool refreshLicense = false;
+        {
+            std::lock_guard<std::mutex> guard(g_authMutex);
+
+            if (!g_refreshToken.empty()) {
+                const auto now = std::chrono::system_clock::now();
+                if (g_refreshTokenExpiry <= now) {
+                    ClearAuthenticationStateLocked(L"Session expired. Please sign in again.", antivirus::kRpcResultNotAuthenticated);
+                } else if (g_accessTokenExpiry <= now + std::chrono::minutes(1)) {
+                    refreshToken = g_refreshToken;
+                }
+            }
+
+            if (IsAuthenticatedLocked() && IsLicenseRefreshDueLocked()) {
+                refreshLicense = true;
+            }
+        }
+
+        if (!refreshToken.empty()) {
+            const antivirus::RefreshResponse refreshResponse = antivirus::BackendRefresh(refreshToken);
+
+            std::lock_guard<std::mutex> guard(g_authMutex);
+            if (g_refreshToken == refreshToken && !g_refreshToken.empty()) {
+                if (refreshResponse.status.success) {
+                    g_accessToken = refreshResponse.tokens.accessToken;
+                    g_refreshToken = refreshResponse.tokens.refreshToken;
+                    g_accessTokenExpiry = refreshResponse.tokens.accessExpiry;
+                    g_refreshTokenExpiry = refreshResponse.tokens.refreshExpiry;
+                    g_lastAuthResult = antivirus::kRpcResultOk;
+                    g_lastAuthMessage.clear();
+                } else if (IsRefreshFailureFinal(refreshResponse.status)) {
+                    const std::wstring message = refreshResponse.status.message.empty()
+                        ? L"Session expired. Please sign in again."
+                        : refreshResponse.status.message;
+                    ClearAuthenticationStateLocked(message, antivirus::kRpcResultNotAuthenticated);
+                } else {
+                    if (!refreshResponse.status.message.empty()) {
+                        g_lastAuthMessage = refreshResponse.status.message;
+                    }
+                    transientRefreshFailure = true;
+                }
+            }
+        }
+
+        if (refreshLicense) {
+            const long licenseRefreshResult = RefreshLicenseStateFromBackend(true);
+            if (licenseRefreshResult == antivirus::kRpcResultBackendUnavailable ||
+                licenseRefreshResult == antivirus::kRpcResultTransportError ||
+                licenseRefreshResult == antivirus::kRpcResultUnexpectedResponse) {
+                transientRefreshFailure = true;
+            }
+        }
+
+        const DWORD waitTimeoutMs = transientRefreshFailure ? 30000 : CalculateNextAuthWakeDelayMs();
+        const DWORD waitResult = WaitForMultipleObjects(
+            static_cast<DWORD>(std::size(waitHandles)),
+            waitHandles,
+            FALSE,
+            waitTimeoutMs
+        );
+
+        if (waitResult == WAIT_OBJECT_0) {
+            return 0;
+        }
+
+        if (waitResult == WAIT_FAILED) {
+            return 1;
+        }
+    }
+}
+
+bool StartAuthWorker() {
+    g_authStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_authWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_authStopEvent || !g_authWakeEvent) {
+        StopAuthWorker();
+        return false;
+    }
+
+    g_authWorkerThread = CreateThread(nullptr, 0, AuthWorkerThread, nullptr, 0, nullptr);
+    if (!g_authWorkerThread) {
+        StopAuthWorker();
+        return false;
+    }
+
+    return true;
+}
+
+void StopAuthWorker() {
+    if (g_authStopEvent) {
+        SetEvent(g_authStopEvent);
+    }
+
+    if (g_authWorkerThread) {
+        WaitForSingleObject(g_authWorkerThread, 5000);
+        CloseHandle(g_authWorkerThread);
+        g_authWorkerThread = nullptr;
+    }
+
+    if (g_authWakeEvent) {
+        CloseHandle(g_authWakeEvent);
+        g_authWakeEvent = nullptr;
+    }
+
+    if (g_authStopEvent) {
+        CloseHandle(g_authStopEvent);
+        g_authStopEvent = nullptr;
+    }
+
+    std::lock_guard<std::mutex> guard(g_authMutex);
+    ClearAuthenticationStateLocked(L"User is not authenticated.", antivirus::kRpcResultNotAuthenticated);
 }
 
 RPC_STATUS StartRpcServer() {
@@ -475,8 +1016,21 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
         return;
     }
 
+    g_deviceName = DetectDeviceName();
+    g_deviceMac = DetectPrimaryMacAddress();
+    if (g_deviceMac.empty()) {
+        UpdateServiceStatus(SERVICE_STOPPED, ERROR_NOT_SUPPORTED);
+        return;
+    }
+
+    if (!StartAuthWorker()) {
+        UpdateServiceStatus(SERVICE_STOPPED, GetLastError() != NO_ERROR ? GetLastError() : ERROR_SERVICE_SPECIFIC_ERROR);
+        return;
+    }
+
     const RPC_STATUS rpcStatus = StartRpcServer();
     if (rpcStatus != RPC_S_OK) {
+        StopAuthWorker();
         UpdateServiceStatus(SERVICE_STOPPED, rpcStatus);
         return;
     }
@@ -484,31 +1038,214 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
     LaunchTrayApplicationsForExistingSessions();
     UpdateServiceStatus(SERVICE_RUNNING);
 
-    RpcMgmtWaitServerListen();
+    const RPC_STATUS waitStatus = RpcMgmtWaitServerListen();
+    const DWORD stopError = (waitStatus == RPC_S_OK || waitStatus == RPC_S_NOT_LISTENING) ? NO_ERROR : waitStatus;
 
-    UpdateServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 5000);
+    UpdateServiceStatus(SERVICE_STOP_PENDING, stopError, 5000);
+    StopAuthWorker();
     StopAllTrayApplications();
     StopRpcServer();
-    UpdateServiceStatus(SERVICE_STOPPED);
+    UpdateServiceStatus(SERVICE_STOPPED, stopError);
 }
 
-} // namespace
+} 
 
-extern "C" void RequestServiceStop(void)
+extern "C" void ServiceRequestServiceStop(void)
 {
-    if (g_stopRequested.exchange(true))
+    if (g_stopRequested.exchange(true)) {
         return;
-
-    
-    UpdateServiceStatus(SERVICE_STOP_PENDING, NO_ERROR, 10000);
-
-  
-    HANDLE stopThread = CreateThread(nullptr, 0, StopRpcServerThread, nullptr, 0, nullptr);
-    if (stopThread) {
-        CloseHandle(stopThread);
     }
 
-   
+    HANDLE stopThread = CreateThread(
+        nullptr,
+        0,
+        StopRpcListeningThread,
+        nullptr,
+        0,
+        nullptr
+    );
+
+    if (stopThread) {
+        CloseHandle(stopThread);
+    } else {
+        RpcMgmtStopServerListening(nullptr);
+    }
+}
+
+extern "C" long ServiceGetAuthenticationState(
+    long* isAuthenticated,
+    long usernameCapacity,
+    wchar_t* username,
+    long messageCapacity,
+    wchar_t* message
+) {
+    if (isAuthenticated) {
+        *isAuthenticated = 0;
+    }
+    CopyRpcText(L"", usernameCapacity, username);
+    CopyRpcText(L"", messageCapacity, message);
+
+    std::lock_guard<std::mutex> guard(g_authMutex);
+    if (!g_accessToken.empty() && !g_authenticatedUsername.empty()) {
+        if (isAuthenticated) {
+            *isAuthenticated = 1;
+        }
+        CopyRpcText(g_authenticatedUsername, usernameCapacity, username);
+        return antivirus::kRpcResultOk;
+    }
+
+    CopyRpcText(g_lastAuthMessage, messageCapacity, message);
+    return g_lastAuthResult;
+}
+
+extern "C" long ServiceLoginUser(
+    wchar_t* username,
+    wchar_t* password,
+    long* isAuthenticated,
+    long messageCapacity,
+    wchar_t* message
+) {
+    if (isAuthenticated) {
+        *isAuthenticated = 0;
+    }
+    CopyRpcText(L"", messageCapacity, message);
+
+    if (!username || !password || username[0] == L'\0' || password[0] == L'\0') {
+        CopyRpcText(L"Username and password are required.", messageCapacity, message);
+        return antivirus::kRpcResultInvalidCredentials;
+    }
+
+    const antivirus::LoginResponse loginResponse = antivirus::BackendLogin(username, password);
+    if (!loginResponse.status.success) {
+        CopyRpcText(loginResponse.status.message, messageCapacity, message);
+        return MapBackendStatusToRpcResult(loginResponse.status, true);
+    }
+
+    const antivirus::UserProfileResponse profileResponse = antivirus::BackendGetCurrentUser(loginResponse.tokens.accessToken);
+    if (!profileResponse.status.success) {
+        const std::wstring errorMessage = profileResponse.status.message.empty()
+            ? L"Authentication succeeded, but the user profile could not be loaded."
+            : profileResponse.status.message;
+        CopyRpcText(errorMessage, messageCapacity, message);
+        return MapBackendStatusToRpcResult(profileResponse.status, false);
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        StoreAuthenticatedStateLocked(profileResponse.profile, loginResponse.tokens);
+    }
+
+    WakeAuthWorker();
+
+    if (isAuthenticated) {
+        *isAuthenticated = 1;
+    }
+    CopyRpcText(L"Authentication successful.", messageCapacity, message);
+    return antivirus::kRpcResultOk;
+}
+
+extern "C" long ServiceLogoutUser(
+    long messageCapacity,
+    wchar_t* message
+) {
+    {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        ClearAuthenticationStateLocked(L"User is not authenticated.", antivirus::kRpcResultNotAuthenticated);
+    }
+
+    WakeAuthWorker();
+    CopyRpcText(L"Signed out successfully.", messageCapacity, message);
+    return antivirus::kRpcResultOk;
+}
+
+extern "C" long ServiceGetLicenseState(
+    long* licenseState,
+    long expirationCapacity,
+    wchar_t* expirationDate,
+    long messageCapacity,
+    wchar_t* message
+) {
+    if (licenseState) {
+        *licenseState = antivirus::kLicenseStateUnknown;
+    }
+    CopyRpcText(L"", expirationCapacity, expirationDate);
+    CopyRpcText(L"", messageCapacity, message);
+
+    const long refreshResult = RefreshLicenseStateFromBackend(false);
+
+    std::wstring expiration;
+    std::wstring currentMessage;
+    long currentState = antivirus::kLicenseStateUnknown;
+    {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        SnapshotLicenseOutputsLocked(&currentState, &expiration, &currentMessage);
+    }
+
+    if (licenseState) {
+        *licenseState = currentState;
+    }
+    CopyRpcText(expiration, expirationCapacity, expirationDate);
+    CopyRpcText(currentMessage, messageCapacity, message);
+
+    if (refreshResult == antivirus::kRpcResultNotAuthenticated ||
+        refreshResult == antivirus::kRpcResultBackendUnavailable ||
+        refreshResult == antivirus::kRpcResultTransportError ||
+        refreshResult == antivirus::kRpcResultUnexpectedResponse) {
+        if (refreshResult == antivirus::kRpcResultNotAuthenticated && currentMessage.empty()) {
+            CopyRpcText(L"User is not authenticated.", messageCapacity, message);
+        }
+        return refreshResult;
+    }
+
+    return currentState == antivirus::kLicenseStateActive
+        ? antivirus::kRpcResultOk
+        : antivirus::kRpcResultLicenseRequired;
+}
+
+extern "C" long ServiceActivateProduct(
+    wchar_t* activationCode,
+    long* licenseState,
+    long expirationCapacity,
+    wchar_t* expirationDate,
+    long messageCapacity,
+    wchar_t* message
+) {
+    if (licenseState) {
+        *licenseState = antivirus::kLicenseStateUnknown;
+    }
+    CopyRpcText(L"", expirationCapacity, expirationDate);
+    CopyRpcText(L"", messageCapacity, message);
+
+    if (!activationCode || activationCode[0] == L'\0') {
+        if (licenseState) {
+            *licenseState = antivirus::kLicenseStateMissing;
+        }
+        CopyRpcText(L"Activation code is required.", messageCapacity, message);
+        return antivirus::kRpcResultActivationFailed;
+    }
+
+    const long activationResult = ActivateLicenseViaBackend(activationCode);
+
+    std::wstring expiration;
+    std::wstring currentMessage;
+    long currentState = antivirus::kLicenseStateUnknown;
+    {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        SnapshotLicenseOutputsLocked(&currentState, &expiration, &currentMessage);
+    }
+
+    if (licenseState) {
+        *licenseState = currentState;
+    }
+    CopyRpcText(expiration, expirationCapacity, expirationDate);
+
+    if (activationResult == antivirus::kRpcResultOk) {
+        CopyRpcText(L"Product activation successful.", messageCapacity, message);
+        return antivirus::kRpcResultOk;
+    }
+
+    CopyRpcText(currentMessage, messageCapacity, message);
+    return activationResult;
 }
 
 int wmain(int argc, wchar_t* argv[]) {
@@ -544,6 +1281,102 @@ int wmain(int argc, wchar_t* argv[]) {
             std::fwprintf(stderr, L"RPC stop request failed.\n");
             return 1;
         }
+
+        if (command == L"--auth-state") {
+            antivirus::RpcAuthenticationState state;
+            if (!GetAuthenticationStateViaRpc(&state)) {
+                std::fwprintf(stderr, L"Unable to query authentication state via RPC.\n");
+                return 1;
+            }
+
+            std::wprintf(L"Authenticated: %ls\n", state.isAuthenticated ? L"yes" : L"no");
+            if (!state.username.empty()) {
+                std::wprintf(L"Username: %ls\n", state.username.c_str());
+            }
+            if (!state.message.empty()) {
+                std::wprintf(L"Message: %ls\n", state.message.c_str());
+            }
+            std::wprintf(L"Result code: %ld\n", state.resultCode);
+            return state.resultCode == antivirus::kRpcResultOk ? 0 : 1;
+        }
+
+        if (command == L"--login") {
+            if (argc < 4) {
+                std::fwprintf(stderr, L"Usage: antivirus_service.exe --login <username> <password>\n");
+                return 1;
+            }
+
+            antivirus::RpcAuthenticationState state;
+            if (!LoginUserViaRpc(argv[2], argv[3], &state)) {
+                std::fwprintf(stderr, L"Unable to perform login via RPC.\n");
+                return 1;
+            }
+
+            if (!state.message.empty()) {
+                std::wprintf(L"%ls\n", state.message.c_str());
+            }
+            if (state.isAuthenticated && !state.username.empty()) {
+                std::wprintf(L"Authenticated as: %ls\n", state.username.c_str());
+            }
+            std::wprintf(L"Result code: %ld\n", state.resultCode);
+            return state.resultCode == antivirus::kRpcResultOk ? 0 : 1;
+        }
+
+        if (command == L"--logout") {
+            std::wstring message;
+            long resultCode = antivirus::kRpcResultUnexpectedResponse;
+            if (!LogoutUserViaRpc(&message, &resultCode)) {
+                std::fwprintf(stderr, L"Unable to perform logout via RPC.\n");
+                return 1;
+            }
+
+            if (!message.empty()) {
+                std::wprintf(L"%ls\n", message.c_str());
+            }
+            std::wprintf(L"Result code: %ld\n", resultCode);
+            return resultCode == antivirus::kRpcResultOk ? 0 : 1;
+        }
+
+        if (command == L"--license-state") {
+            antivirus::RpcLicenseState state;
+            if (!GetLicenseStateViaRpc(&state)) {
+                std::fwprintf(stderr, L"Unable to query license state via RPC.\n");
+                return 1;
+            }
+
+            std::wprintf(L"License state: %ld\n", state.licenseState);
+            if (!state.expirationDate.empty()) {
+                std::wprintf(L"Expiration: %ls\n", state.expirationDate.c_str());
+            }
+            if (!state.message.empty()) {
+                std::wprintf(L"Message: %ls\n", state.message.c_str());
+            }
+            std::wprintf(L"Result code: %ld\n", state.resultCode);
+            return state.resultCode == antivirus::kRpcResultOk ? 0 : 1;
+        }
+
+        if (command == L"--activate") {
+            if (argc < 3) {
+                std::fwprintf(stderr, L"Usage: antivirus_service.exe --activate <code>\n");
+                return 1;
+            }
+
+            antivirus::RpcLicenseState state;
+            if (!ActivateProductViaRpc(argv[2], &state)) {
+                std::fwprintf(stderr, L"Unable to activate product via RPC.\n");
+                return 1;
+            }
+
+            if (!state.message.empty()) {
+                std::wprintf(L"%ls\n", state.message.c_str());
+            }
+            if (!state.expirationDate.empty()) {
+                std::wprintf(L"Expiration: %ls\n", state.expirationDate.c_str());
+            }
+            std::wprintf(L"License state: %ld\n", state.licenseState);
+            std::wprintf(L"Result code: %ld\n", state.resultCode);
+            return state.resultCode == antivirus::kRpcResultOk ? 0 : 1;
+        }
     }
 
     SERVICE_TABLE_ENTRYW serviceTable[] = {
@@ -553,3 +1386,4 @@ int wmain(int argc, wchar_t* argv[]) {
 
     return StartServiceCtrlDispatcherW(serviceTable) ? 0 : 1;
 }
+
