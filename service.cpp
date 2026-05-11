@@ -1171,7 +1171,7 @@ extern "C" long ServiceGetLicenseState(
     CopyRpcText(L"", expirationCapacity, expirationDate);
     CopyRpcText(L"", messageCapacity, message);
 
-    const long refreshResult = RefreshLicenseStateFromBackend(false);
+    const long refreshResult = RefreshLicenseStateFromBackend(true);
 
     std::wstring expiration;
     std::wstring currentMessage;

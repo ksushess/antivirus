@@ -20,7 +20,7 @@ bool g_isRefreshingState = false;
 std::wstring g_transientErrorMessage;
 
 constexpr UINT_PTR kStatePollTimerId = 1;
-constexpr UINT kStatePollIntervalMs = 15000;
+constexpr UINT kStatePollIntervalMs = 10000;
 
 enum class LaunchContext {
     ServiceManaged,
