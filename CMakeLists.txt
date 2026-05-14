@@ -75,6 +75,8 @@ target_include_directories(antivirus PRIVATE
 )
 target_link_libraries(antivirus PRIVATE
     advapi32
+    comdlg32
+    ole32
     rpcrt4
     shell32
     user32
@@ -83,12 +85,13 @@ target_link_libraries(antivirus PRIVATE
 add_executable(antivirus_service
     service.cpp
     rpc_client.cpp
+    scan_engine.cpp
     ziopvo_client.cpp
     "${RPC_CLIENT_STUB}"
     "${RPC_SERVER_STUB}"
 )
 set_source_files_properties("${RPC_SERVER_STUB}" PROPERTIES
-    COMPILE_DEFINITIONS "RequestServiceStop=ServiceRequestServiceStop;GetAuthenticationState=ServiceGetAuthenticationState;LoginUser=ServiceLoginUser;LogoutUser=ServiceLogoutUser;GetLicenseState=ServiceGetLicenseState;ActivateProduct=ServiceActivateProduct"
+    COMPILE_DEFINITIONS "RequestServiceStop=ServiceRequestServiceStop;GetAuthenticationState=ServiceGetAuthenticationState;LoginUser=ServiceLoginUser;LogoutUser=ServiceLogoutUser;GetLicenseState=ServiceGetLicenseState;ActivateProduct=ServiceActivateProduct;GetAvDatabaseInfo=ServiceGetAvDatabaseInfo;ScanFilePath=ServiceScanFilePath;ScanDirectoryPath=ServiceScanDirectoryPath;ScanFixedDrives=ServiceScanFixedDrives;ConfigureScheduledScan=ServiceConfigureScheduledScan;GetScheduledScanState=ServiceGetScheduledScanState;AddMonitoredDirectory=ServiceAddMonitoredDirectory;RemoveMonitoredDirectory=ServiceRemoveMonitoredDirectory;GetMonitoringState=ServiceGetMonitoringState"
 )
 target_include_directories(antivirus_service PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -96,6 +99,7 @@ target_include_directories(antivirus_service PRIVATE
 )
 target_link_libraries(antivirus_service PRIVATE
     advapi32
+    bcrypt
     crypt32
     iphlpapi
     rpcrt4

@@ -39,4 +39,71 @@ interface AntivirusRpc
         [in] long messageCapacity,
         [out, string, size_is(messageCapacity)] wchar_t* message
     );
+    long GetAvDatabaseInfo(
+        [out] long* isLoaded,
+        [out] long* recordCount,
+        [in] long releaseDateCapacity,
+        [out, string, size_is(releaseDateCapacity)] wchar_t* releaseDate,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long ScanFilePath(
+        [string, in] wchar_t* path,
+        [out] long* isMalicious,
+        [out] long* scannedCount,
+        [out] long* detectedCount,
+        [in] long summaryCapacity,
+        [out, string, size_is(summaryCapacity)] wchar_t* summary
+    );
+    long ScanDirectoryPath(
+        [string, in] wchar_t* path,
+        [out] long* hasDetections,
+        [out] long* scannedCount,
+        [out] long* detectedCount,
+        [in] long summaryCapacity,
+        [out, string, size_is(summaryCapacity)] wchar_t* summary
+    );
+    long ScanFixedDrives(
+        [out] long* hasDetections,
+        [out] long* scannedCount,
+        [out] long* detectedCount,
+        [in] long summaryCapacity,
+        [out, string, size_is(summaryCapacity)] wchar_t* summary
+    );
+    long ConfigureScheduledScan(
+        [in] long isEnabled,
+        [in] long intervalSeconds,
+        [string, in] wchar_t* targetPath,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long GetScheduledScanState(
+        [out] long* isEnabled,
+        [out] long* intervalSeconds,
+        [in] long targetCapacity,
+        [out, string, size_is(targetCapacity)] wchar_t* targetPath,
+        [in] long nextRunCapacity,
+        [out, string, size_is(nextRunCapacity)] wchar_t* nextRunText,
+        [in] long lastRunCapacity,
+        [out, string, size_is(lastRunCapacity)] wchar_t* lastRunText,
+        [out] long* lastResultCode,
+        [in] long summaryCapacity,
+        [out, string, size_is(summaryCapacity)] wchar_t* lastSummary
+    );
+    long AddMonitoredDirectory(
+        [string, in] wchar_t* path,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long RemoveMonitoredDirectory(
+        [string, in] wchar_t* path,
+        [in] long messageCapacity,
+        [out, string, size_is(messageCapacity)] wchar_t* message
+    );
+    long GetMonitoringState(
+        [in] long directoriesCapacity,
+        [out, string, size_is(directoriesCapacity)] wchar_t* directories,
+        [in] long eventsCapacity,
+        [out, string, size_is(eventsCapacity)] wchar_t* events
+    );
 }

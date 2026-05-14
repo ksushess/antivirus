@@ -1,8 +1,12 @@
 #include <windows.h>
+#include <commdlg.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <vector>
+#include <memory>
 #include <string>
 
 #include "rpc_client.h"
@@ -18,6 +22,14 @@ HANDLE g_instanceMutex = nullptr;
 HFONT g_uiFont = nullptr;
 bool g_isRefreshingState = false;
 std::wstring g_transientErrorMessage;
+std::wstring g_scanSummaryText;
+std::wstring g_selectedScheduleFolder;
+std::wstring g_selectedScanFilePath;
+bool g_scanInProgress = false;
+bool g_hasCachedScheduledState = false;
+bool g_hasCachedMonitoringState = false;
+antivirus::RpcScheduledScanState g_cachedScheduledState;
+antivirus::RpcMonitoringState g_cachedMonitoringState;
 
 constexpr UINT_PTR kStatePollTimerId = 1;
 constexpr UINT kStatePollIntervalMs = 10000;
@@ -34,6 +46,14 @@ enum class ScreenMode {
     Licensed
 };
 
+enum class ScanOperation {
+    File,
+    Directory,
+    FixedDrives
+};
+
+constexpr UINT kScanCompletedMessage = WM_APP + 10;
+
 enum ControlId : int {
     kHeaderLabelId = 3001,
     kUsernameLabelId,
@@ -48,7 +68,28 @@ enum ControlId : int {
     kActivationLabelId,
     kActivationEditId,
     kActivationButtonId,
-    kLogoutButtonId
+    kLogoutButtonId,
+    kDatabaseLabelId,
+    kScanFilePathLabelId,
+    kScanFilePathEditId,
+    kScanFileBrowseButtonId,
+    kScanFileButtonId,
+    kScanFixedDrivesButtonId,
+    kScanFolderButtonId,
+    kScanResultsLabelId,
+    kScanResultsEditId,
+    kScheduleSectionLabelId,
+    kScheduleTargetLabelId,
+    kSchedulePickFolderButtonId,
+    kScheduleIntervalLabelId,
+    kScheduleIntervalEditId,
+    kScheduleEnableButtonId,
+    kScheduleDisableButtonId,
+    kMonitoringSectionLabelId,
+    kMonitoringAddButtonId,
+    kMonitoringRemoveButtonId,
+    kBackgroundStatusLabelId,
+    kBackgroundStatusEditId
 };
 
 struct Controls {
@@ -66,6 +107,27 @@ struct Controls {
     HWND activationEdit = nullptr;
     HWND activationButton = nullptr;
     HWND logoutButton = nullptr;
+    HWND databaseLabel = nullptr;
+    HWND scanFilePathLabel = nullptr;
+    HWND scanFilePathEdit = nullptr;
+    HWND scanFileBrowseButton = nullptr;
+    HWND scanFileButton = nullptr;
+    HWND scanFixedDrivesButton = nullptr;
+    HWND scanFolderButton = nullptr;
+    HWND scanResultsLabel = nullptr;
+    HWND scanResultsEdit = nullptr;
+    HWND scheduleSectionLabel = nullptr;
+    HWND scheduleTargetLabel = nullptr;
+    HWND schedulePickFolderButton = nullptr;
+    HWND scheduleIntervalLabel = nullptr;
+    HWND scheduleIntervalEdit = nullptr;
+    HWND scheduleEnableButton = nullptr;
+    HWND scheduleDisableButton = nullptr;
+    HWND monitoringSectionLabel = nullptr;
+    HWND monitoringAddButton = nullptr;
+    HWND monitoringRemoveButton = nullptr;
+    HWND backgroundStatusLabel = nullptr;
+    HWND backgroundStatusEdit = nullptr;
 };
 
 struct ScreenState {
@@ -73,8 +135,25 @@ struct ScreenState {
     std::wstring username;
     std::wstring protectionText;
     std::wstring licenseText;
+    std::wstring databaseText;
+    std::wstring scheduleTargetText;
+    std::wstring scheduleIntervalText;
+    std::wstring backgroundStatusText;
     std::wstring errorText;
     bool protectionUnlocked = false;
+    bool scanAvailable = false;
+};
+
+struct ScanRequestContext {
+    HWND window = nullptr;
+    ScanOperation operation = ScanOperation::File;
+    std::wstring path;
+};
+
+struct ScanCompletedState {
+    bool rpcOk = false;
+    ScanOperation operation = ScanOperation::File;
+    antivirus::RpcScanSummary summary;
 };
 
 Controls g_controls;
@@ -431,6 +510,7 @@ void CreateChildControls(HWND window) {
     g_controls.usernameLabel = CreateUiControl(window, L"STATIC", L"", WS_VISIBLE, kUsernameLabelId);
     g_controls.protectionLabel = CreateUiControl(window, L"STATIC", L"", WS_VISIBLE, kProtectionLabelId);
     g_controls.licenseLabel = CreateUiControl(window, L"STATIC", L"", WS_VISIBLE, kLicenseLabelId);
+    g_controls.databaseLabel = CreateUiControl(window, L"STATIC", L"", WS_VISIBLE, kDatabaseLabelId);
     g_controls.errorLabel = CreateUiControl(window, L"STATIC", L"", WS_VISIBLE, kErrorLabelId);
 
     g_controls.loginUsernameLabel = CreateUiControl(window, L"STATIC", L"Username", WS_VISIBLE, kLoginUsernameLabelId);
@@ -443,7 +523,38 @@ void CreateChildControls(HWND window) {
     g_controls.activationEdit = CreateUiControl(window, L"EDIT", L"", WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kActivationEditId);
     g_controls.activationButton = CreateUiControl(window, L"BUTTON", L"Activate", WS_VISIBLE | WS_TABSTOP, kActivationButtonId);
     g_controls.logoutButton = CreateUiControl(window, L"BUTTON", L"Log Out", WS_VISIBLE | WS_TABSTOP, kLogoutButtonId);
-
+    g_controls.scanFilePathLabel = CreateUiControl(window, L"STATIC", L"File path", WS_VISIBLE, kScanFilePathLabelId);
+    g_controls.scanFilePathEdit = CreateUiControl(window, L"EDIT", L"", WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kScanFilePathEditId);
+    g_controls.scanFileBrowseButton = CreateUiControl(window, L"BUTTON", L"Browse", WS_VISIBLE | WS_TABSTOP, kScanFileBrowseButtonId);
+    g_controls.scanFileButton = CreateUiControl(window, L"BUTTON", L"Scan File", WS_VISIBLE | WS_TABSTOP, kScanFileButtonId);
+    g_controls.scanFixedDrivesButton = CreateUiControl(window, L"BUTTON", L"Scan Fixed Drives", WS_VISIBLE | WS_TABSTOP, kScanFixedDrivesButtonId);
+    g_controls.scanFolderButton = CreateUiControl(window, L"BUTTON", L"Scan Folder", WS_VISIBLE | WS_TABSTOP, kScanFolderButtonId);
+    g_controls.scanResultsLabel = CreateUiControl(window, L"STATIC", L"Scan Results", WS_VISIBLE, kScanResultsLabelId);
+    g_controls.scanResultsEdit = CreateUiControl(
+        window,
+        L"EDIT",
+        L"",
+        WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_TABSTOP,
+        kScanResultsEditId
+    );
+    g_controls.scheduleSectionLabel = CreateUiControl(window, L"STATIC", L"Automation", WS_VISIBLE, kScheduleSectionLabelId);
+    g_controls.scheduleTargetLabel = CreateUiControl(window, L"STATIC", L"Target folder: not selected", WS_VISIBLE, kScheduleTargetLabelId);
+    g_controls.schedulePickFolderButton = CreateUiControl(window, L"BUTTON", L"Choose", WS_VISIBLE | WS_TABSTOP, kSchedulePickFolderButtonId);
+    g_controls.scheduleIntervalLabel = CreateUiControl(window, L"STATIC", L"Every (sec)", WS_VISIBLE, kScheduleIntervalLabelId);
+    g_controls.scheduleIntervalEdit = CreateUiControl(window, L"EDIT", L"30", WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, kScheduleIntervalEditId);
+    g_controls.scheduleEnableButton = CreateUiControl(window, L"BUTTON", L"Enable", WS_VISIBLE | WS_TABSTOP, kScheduleEnableButtonId);
+    g_controls.scheduleDisableButton = CreateUiControl(window, L"BUTTON", L"Disable", WS_VISIBLE | WS_TABSTOP, kScheduleDisableButtonId);
+    g_controls.monitoringSectionLabel = CreateUiControl(window, L"STATIC", L"Monitoring", WS_VISIBLE, kMonitoringSectionLabelId);
+    g_controls.monitoringAddButton = CreateUiControl(window, L"BUTTON", L"Add Folder", WS_VISIBLE | WS_TABSTOP, kMonitoringAddButtonId);
+    g_controls.monitoringRemoveButton = CreateUiControl(window, L"BUTTON", L"Remove Folder", WS_VISIBLE | WS_TABSTOP, kMonitoringRemoveButtonId);
+    g_controls.backgroundStatusLabel = CreateUiControl(window, L"STATIC", L"Automation Status", WS_VISIBLE, kBackgroundStatusLabelId);
+    g_controls.backgroundStatusEdit = CreateUiControl(
+        window,
+        L"EDIT",
+        L"",
+        WS_VISIBLE | WS_BORDER | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL | WS_TABSTOP,
+        kBackgroundStatusEditId
+    );
 }
 
 void LayoutControls(HWND window) {
@@ -457,22 +568,56 @@ void LayoutControls(HWND window) {
     const int fieldLeft = left + labelColumnWidth + 10;
     const int fieldWidth = std::max(120, contentWidth - labelColumnWidth - 10);
     const int fullWidth = std::max(120, contentWidth);
+    const int scanPathTop = top + 260;
+    const int buttonTop = top + 296;
+    const int resultsTop = top + 340;
+    const int clientHeight = static_cast<int>(clientRect.bottom - clientRect.top);
+    const int resultsHeight = 120;
+    const int scheduleTop = resultsTop + 24 + resultsHeight + 12;
+    const int monitoringTop = scheduleTop + 74;
+    const int backgroundTop = monitoringTop + 54;
+    const int backgroundHeight = std::max(100, clientHeight - backgroundTop - 64);
 
     MoveWindow(g_controls.headerLabel, left, top, fullWidth, 24, TRUE);
     MoveWindow(g_controls.usernameLabel, left, top + 34, fullWidth, 20, TRUE);
     MoveWindow(g_controls.protectionLabel, left, top + 58, fullWidth, 20, TRUE);
     MoveWindow(g_controls.licenseLabel, left, top + 82, fullWidth, 20, TRUE);
-    MoveWindow(g_controls.errorLabel, left, top + 110, fullWidth, 34, TRUE);
+    MoveWindow(g_controls.databaseLabel, left, top + 106, fullWidth, 20, TRUE);
+    MoveWindow(g_controls.errorLabel, left, top + 134, fullWidth, 42, TRUE);
 
-    MoveWindow(g_controls.loginUsernameLabel, left, top + 160, labelColumnWidth, 20, TRUE);
-    MoveWindow(g_controls.loginUsernameEdit, fieldLeft, top + 156, fieldWidth, 24, TRUE);
-    MoveWindow(g_controls.loginPasswordLabel, left, top + 194, labelColumnWidth, 20, TRUE);
-    MoveWindow(g_controls.loginPasswordEdit, fieldLeft, top + 190, fieldWidth, 24, TRUE);
-    MoveWindow(g_controls.loginButton, fieldLeft, top + 226, 120, 28, TRUE);
+    MoveWindow(g_controls.loginUsernameLabel, left, top + 186, labelColumnWidth, 20, TRUE);
+    MoveWindow(g_controls.loginUsernameEdit, fieldLeft, top + 182, fieldWidth, 24, TRUE);
+    MoveWindow(g_controls.loginPasswordLabel, left, top + 220, labelColumnWidth, 20, TRUE);
+    MoveWindow(g_controls.loginPasswordEdit, fieldLeft, top + 216, fieldWidth, 24, TRUE);
+    MoveWindow(g_controls.loginButton, fieldLeft, top + 252, 120, 28, TRUE);
 
-    MoveWindow(g_controls.activationLabel, left, top + 160, labelColumnWidth, 20, TRUE);
-    MoveWindow(g_controls.activationEdit, fieldLeft, top + 156, fieldWidth, 24, TRUE);
-    MoveWindow(g_controls.activationButton, fieldLeft, top + 192, 120, 28, TRUE);
+    MoveWindow(g_controls.activationLabel, left, top + 186, labelColumnWidth, 20, TRUE);
+    MoveWindow(g_controls.activationEdit, fieldLeft, top + 182, fieldWidth, 24, TRUE);
+    MoveWindow(g_controls.activationButton, fieldLeft, top + 218, 120, 28, TRUE);
+
+    MoveWindow(g_controls.scanFilePathLabel, left, scanPathTop + 4, 70, 20, TRUE);
+    MoveWindow(g_controls.scanFilePathEdit, left + 74, scanPathTop, fullWidth - 170, 24, TRUE);
+    MoveWindow(g_controls.scanFileBrowseButton, clientRect.right - 90, scanPathTop - 2, 70, 28, TRUE);
+    MoveWindow(g_controls.scanFileButton, left, buttonTop, 140, 30, TRUE);
+    MoveWindow(g_controls.scanFixedDrivesButton, left + 150, buttonTop, 160, 30, TRUE);
+    MoveWindow(g_controls.scanFolderButton, left + 320, buttonTop, 140, 30, TRUE);
+    MoveWindow(g_controls.scanResultsLabel, left, resultsTop, fullWidth, 20, TRUE);
+    MoveWindow(g_controls.scanResultsEdit, left, resultsTop + 24, fullWidth, resultsHeight, TRUE);
+
+    MoveWindow(g_controls.scheduleSectionLabel, left, scheduleTop, fullWidth, 20, TRUE);
+    MoveWindow(g_controls.scheduleTargetLabel, left, scheduleTop + 24, fullWidth - 100, 20, TRUE);
+    MoveWindow(g_controls.schedulePickFolderButton, clientRect.right - 110, scheduleTop + 20, 90, 28, TRUE);
+    MoveWindow(g_controls.scheduleIntervalLabel, left, scheduleTop + 48, 82, 20, TRUE);
+    MoveWindow(g_controls.scheduleIntervalEdit, left + 88, scheduleTop + 46, 56, 24, TRUE);
+    MoveWindow(g_controls.scheduleEnableButton, left + 160, scheduleTop + 44, 92, 28, TRUE);
+    MoveWindow(g_controls.scheduleDisableButton, left + 260, scheduleTop + 44, 92, 28, TRUE);
+
+    MoveWindow(g_controls.monitoringSectionLabel, left, monitoringTop, fullWidth, 20, TRUE);
+    MoveWindow(g_controls.monitoringAddButton, left, monitoringTop + 22, 120, 28, TRUE);
+    MoveWindow(g_controls.monitoringRemoveButton, left + 130, monitoringTop + 22, 130, 28, TRUE);
+
+    MoveWindow(g_controls.backgroundStatusLabel, left, backgroundTop, fullWidth, 20, TRUE);
+    MoveWindow(g_controls.backgroundStatusEdit, left, backgroundTop + 24, fullWidth, backgroundHeight, TRUE);
 
     MoveWindow(g_controls.logoutButton, clientRect.right - 160, clientRect.bottom - 60, 140, 30, TRUE);
 }
@@ -480,6 +625,12 @@ void LayoutControls(HWND window) {
 void SetControlVisible(HWND control, bool visible) {
     if (control) {
         ShowWindow(control, visible ? SW_SHOW : SW_HIDE);
+    }
+}
+
+void SetControlEnabled(HWND control, bool enabled) {
+    if (control) {
+        EnableWindow(control, enabled ? TRUE : FALSE);
     }
 }
 
@@ -493,6 +644,41 @@ std::wstring GetEditText(HWND control) {
     GetWindowTextW(control, value.data(), length + 1);
     value.resize(static_cast<size_t>(length));
     return value;
+}
+
+std::wstring ShowOpenFileDialog(HWND owner) {
+    wchar_t filePath[MAX_PATH] = {};
+    OPENFILENAMEW dialog = {};
+    dialog.lStructSize = sizeof(dialog);
+    dialog.hwndOwner = owner;
+    dialog.lpstrFile = filePath;
+    dialog.nMaxFile = static_cast<DWORD>(std::size(filePath));
+    dialog.lpstrFilter = L"All Files\0*.*\0\0";
+    dialog.nFilterIndex = 1;
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_EXPLORER;
+
+    return GetOpenFileNameW(&dialog) ? std::wstring(filePath) : L"";
+}
+
+std::wstring ShowFolderDialog(HWND owner) {
+    BROWSEINFOW browseInfo = {};
+    browseInfo.hwndOwner = owner;
+    browseInfo.lpszTitle = L"Select a folder to scan";
+    browseInfo.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+
+    PIDLIST_ABSOLUTE itemId = SHBrowseForFolderW(&browseInfo);
+    if (!itemId) {
+        return L"";
+    }
+
+    wchar_t folderPath[MAX_PATH] = {};
+    std::wstring result;
+    if (SHGetPathFromIDListW(itemId, folderPath)) {
+        result = folderPath;
+    }
+
+    CoTaskMemFree(itemId);
+    return result;
 }
 
 bool IsDefaultUnauthenticatedMessage(const std::wstring& message) {
@@ -511,13 +697,93 @@ std::wstring BuildProtectionText(long licenseState) {
     }
 }
 
+std::wstring BuildBackgroundStatusText(
+    const antivirus::RpcScheduledScanState& scheduledState,
+    const antivirus::RpcMonitoringState& monitoringState
+) {
+    const auto splitLines = [](const std::wstring& text) {
+        std::vector<std::wstring> lines;
+        std::wstring current;
+        for (wchar_t character : text) {
+            if (character == L'\r') {
+                continue;
+            }
+            if (character == L'\n') {
+                if (!current.empty()) {
+                    lines.push_back(current);
+                    current.clear();
+                }
+                continue;
+            }
+            current += character;
+        }
+        if (!current.empty()) {
+            lines.push_back(current);
+        }
+        return lines;
+    };
+
+    std::wstring targetPath = scheduledState.targetPath.empty()
+        ? (g_selectedScheduleFolder.empty() ? L"not selected" : g_selectedScheduleFolder)
+        : scheduledState.targetPath;
+
+    std::wstring text = L"Schedule: ";
+    text += scheduledState.isEnabled ? L"enabled\r\n" : L"disabled\r\n";
+    text += L"Folder: " + targetPath + L"\r\n";
+    text += L"Interval: " + std::to_wstring(scheduledState.intervalSeconds) + L" sec\r\n";
+    if (!scheduledState.nextRunText.empty()) {
+        text += L"Next: " + scheduledState.nextRunText + L"\r\n";
+    }
+    if (!scheduledState.lastRunText.empty()) {
+        text += L"Last: " + scheduledState.lastRunText + L"\r\n";
+    }
+    if (!scheduledState.lastSummary.empty()) {
+        text += L"Last result:\r\n" + scheduledState.lastSummary + L"\r\n";
+    }
+
+    const std::vector<std::wstring> directories = splitLines(monitoringState.directories);
+    const std::vector<std::wstring> events = splitLines(monitoringState.events);
+
+    text += L"\r\nMonitors: " + std::to_wstring(directories.size()) + L"\r\n";
+    if (!directories.empty()) {
+        const size_t directoriesToShow = std::min<size_t>(directories.size(), 2);
+        for (size_t index = 0; index < directoriesToShow; ++index) {
+            text += L"- " + directories[index] + L"\r\n";
+        }
+        if (directories.size() > directoriesToShow) {
+            text += L"...\r\n";
+        }
+    } else {
+        text += L"No monitored folders\r\n";
+    }
+
+    text += L"\r\nRecent events\r\n";
+    if (!events.empty()) {
+        const size_t firstEvent = events.size() > 3 ? events.size() - 3 : 0;
+        for (size_t index = firstEvent; index < events.size(); ++index) {
+            text += events[index] + L"\r\n";
+        }
+    } else {
+        text += L"No monitoring events yet.";
+    }
+
+    return text;
+}
+
 ScreenState QueryScreenState() {
     ScreenState state;
     state.mode = ScreenMode::Login;
     state.protectionText = L"Protection is blocked until you sign in.";
+    state.scheduleTargetText = g_selectedScheduleFolder.empty()
+        ? L"Target folder: not selected"
+        : L"Target folder: " + g_selectedScheduleFolder;
+    state.scheduleIntervalText = L"30";
 
     antivirus::RpcAuthenticationState authState;
     if (!GetAuthenticationStateViaRpc(&authState)) {
+        if (g_screenState.mode != ScreenMode::Login) {
+            state = g_screenState;
+        }
         state.errorText = !g_transientErrorMessage.empty()
             ? g_transientErrorMessage
             : L"Unable to contact the antivirus service.";
@@ -537,8 +803,12 @@ ScreenState QueryScreenState() {
 
     antivirus::RpcLicenseState licenseState;
     if (!GetLicenseStateViaRpc(&licenseState)) {
-        state.mode = ScreenMode::Activation;
-        state.protectionText = L"Protection is blocked until the license state can be loaded.";
+        if (g_screenState.mode == ScreenMode::Licensed || g_screenState.mode == ScreenMode::Activation) {
+            state = g_screenState;
+        } else {
+            state.mode = ScreenMode::Activation;
+            state.protectionText = L"Protection is blocked until the license state can be loaded.";
+        }
         state.errorText = !g_transientErrorMessage.empty()
             ? g_transientErrorMessage
             : L"Unable to contact the antivirus service.";
@@ -560,10 +830,79 @@ ScreenState QueryScreenState() {
         state.protectionUnlocked = true;
         state.protectionText = L"Protection is active.";
         state.licenseText = L"License valid until: " + licenseState.expirationDate;
+
+        antivirus::RpcAvDatabaseInfo databaseInfo;
+        if (!GetAvDatabaseInfoViaRpc(&databaseInfo)) {
+            if (g_screenState.mode == ScreenMode::Licensed) {
+                state.databaseText = g_screenState.databaseText;
+                state.backgroundStatusText = g_screenState.backgroundStatusText;
+                state.scanAvailable = g_screenState.scanAvailable;
+            } else {
+                state.scanAvailable = false;
+                state.databaseText = L"Antivirus bases: unavailable";
+            }
+            state.errorText = !g_transientErrorMessage.empty()
+                ? g_transientErrorMessage
+                : L"Unable to load antivirus database information.";
+            return state;
+        }
+
+        if (databaseInfo.resultCode == antivirus::kRpcResultOk && databaseInfo.isLoaded) {
+            state.scanAvailable = true;
+            state.databaseText = L"Database release date: " + databaseInfo.releaseDate +
+                L" | Records: " + std::to_wstring(databaseInfo.recordCount);
+
+            antivirus::RpcScheduledScanState scheduledState;
+            antivirus::RpcMonitoringState monitoringState;
+            const bool hasScheduledState = GetScheduledScanStateViaRpc(&scheduledState);
+            const bool hasMonitoringState = GetMonitoringStateViaRpc(&monitoringState);
+
+            if (hasScheduledState && !scheduledState.targetPath.empty()) {
+                g_selectedScheduleFolder = scheduledState.targetPath;
+            }
+            if (hasScheduledState) {
+                g_cachedScheduledState = scheduledState;
+                g_hasCachedScheduledState = true;
+            }
+            if (hasMonitoringState) {
+                g_cachedMonitoringState = monitoringState;
+                g_hasCachedMonitoringState = true;
+            }
+
+            state.scheduleTargetText = g_selectedScheduleFolder.empty()
+                ? L"Target folder: not selected"
+                : L"Target folder: " + g_selectedScheduleFolder;
+            const antivirus::RpcScheduledScanState* scheduledForUi = hasScheduledState
+                ? &scheduledState
+                : (g_hasCachedScheduledState ? &g_cachedScheduledState : nullptr);
+            const antivirus::RpcMonitoringState* monitoringForUi = hasMonitoringState
+                ? &monitoringState
+                : (g_hasCachedMonitoringState ? &g_cachedMonitoringState : nullptr);
+
+            state.scheduleIntervalText = scheduledForUi && scheduledForUi->intervalSeconds > 0
+                ? std::to_wstring(scheduledForUi->intervalSeconds)
+                : L"30";
+
+            if (scheduledForUi && monitoringForUi) {
+                state.backgroundStatusText = BuildBackgroundStatusText(*scheduledForUi, *monitoringForUi);
+            } else {
+                state.backgroundStatusText = g_screenState.backgroundStatusText.empty()
+                    ? L"Automation status will appear after the first successful update."
+                    : g_screenState.backgroundStatusText;
+            }
+        } else {
+            state.scanAvailable = false;
+            state.databaseText = L"Antivirus bases: unavailable";
+            state.protectionText = L"Protection is limited until antivirus bases are loaded.";
+            if (!databaseInfo.message.empty()) {
+                state.errorText = databaseInfo.message;
+            }
+            state.scheduleTargetText = L"Target folder: not selected";
+            state.scheduleIntervalText = L"30";
+        }
+
         if (!g_transientErrorMessage.empty()) {
             state.errorText = g_transientErrorMessage;
-        } else if (licenseState.resultCode != antivirus::kRpcResultOk && !licenseState.message.empty()) {
-            state.errorText = licenseState.message;
         }
         return state;
     }
@@ -571,6 +910,10 @@ ScreenState QueryScreenState() {
     state.mode = ScreenMode::Activation;
     state.protectionText = BuildProtectionText(licenseState.licenseState);
     state.licenseText = L"Enter an activation code to unlock protection.";
+    state.scheduleTargetText = g_selectedScheduleFolder.empty()
+        ? L"Target folder: not selected"
+        : L"Target folder: " + g_selectedScheduleFolder;
+    state.scheduleIntervalText = L"30";
 
     if (!g_transientErrorMessage.empty()) {
         state.errorText = g_transientErrorMessage;
@@ -595,11 +938,28 @@ void ApplyScreenState() {
 
     SetWindowTextW(g_controls.protectionLabel, g_screenState.protectionText.c_str());
     SetWindowTextW(g_controls.licenseLabel, g_screenState.licenseText.c_str());
+    SetWindowTextW(g_controls.databaseLabel, g_screenState.databaseText.c_str());
     SetWindowTextW(g_controls.errorLabel, g_screenState.errorText.c_str());
+    SetWindowTextW(g_controls.scanResultsEdit, g_scanSummaryText.c_str());
+    if (GetFocus() != g_controls.scanFilePathEdit) {
+        const std::wstring currentPathText = GetEditText(g_controls.scanFilePathEdit);
+        if (currentPathText != g_selectedScanFilePath) {
+            SetWindowTextW(g_controls.scanFilePathEdit, g_selectedScanFilePath.c_str());
+        }
+    }
+    SetWindowTextW(g_controls.scheduleTargetLabel, g_screenState.scheduleTargetText.c_str());
+    if (GetFocus() != g_controls.scheduleIntervalEdit) {
+        const std::wstring currentIntervalText = GetEditText(g_controls.scheduleIntervalEdit);
+        if (currentIntervalText != g_screenState.scheduleIntervalText) {
+            SetWindowTextW(g_controls.scheduleIntervalEdit, g_screenState.scheduleIntervalText.c_str());
+        }
+    }
+    SetWindowTextW(g_controls.backgroundStatusEdit, g_screenState.backgroundStatusText.c_str());
 
     const bool showLogin = g_screenState.mode == ScreenMode::Login;
     const bool showActivation = g_screenState.mode == ScreenMode::Activation;
     const bool showLogout = g_screenState.mode != ScreenMode::Login;
+    const bool showScanControls = g_screenState.mode == ScreenMode::Licensed;
 
     SetControlVisible(g_controls.loginUsernameLabel, showLogin);
     SetControlVisible(g_controls.loginUsernameEdit, showLogin);
@@ -611,9 +971,41 @@ void ApplyScreenState() {
     SetControlVisible(g_controls.activationEdit, showActivation);
     SetControlVisible(g_controls.activationButton, showActivation);
     SetControlVisible(g_controls.logoutButton, showLogout);
+    SetControlVisible(g_controls.databaseLabel, !g_screenState.databaseText.empty());
+    SetControlVisible(g_controls.scanFilePathLabel, showScanControls);
+    SetControlVisible(g_controls.scanFilePathEdit, showScanControls);
+    SetControlVisible(g_controls.scanFileBrowseButton, showScanControls);
+    SetControlVisible(g_controls.scanFileButton, showScanControls);
+    SetControlVisible(g_controls.scanFixedDrivesButton, showScanControls);
+    SetControlVisible(g_controls.scanFolderButton, showScanControls);
+    SetControlVisible(g_controls.scanResultsLabel, showScanControls);
+    SetControlVisible(g_controls.scanResultsEdit, showScanControls);
+    SetControlVisible(g_controls.scheduleSectionLabel, showScanControls);
+    SetControlVisible(g_controls.scheduleTargetLabel, showScanControls);
+    SetControlVisible(g_controls.schedulePickFolderButton, showScanControls);
+    SetControlVisible(g_controls.scheduleIntervalLabel, showScanControls);
+    SetControlVisible(g_controls.scheduleIntervalEdit, showScanControls);
+    SetControlVisible(g_controls.scheduleEnableButton, showScanControls);
+    SetControlVisible(g_controls.scheduleDisableButton, showScanControls);
+    SetControlVisible(g_controls.monitoringSectionLabel, showScanControls);
+    SetControlVisible(g_controls.monitoringAddButton, showScanControls);
+    SetControlVisible(g_controls.monitoringRemoveButton, showScanControls);
+    SetControlVisible(g_controls.backgroundStatusLabel, showScanControls);
+    SetControlVisible(g_controls.backgroundStatusEdit, showScanControls);
 
     SetControlVisible(g_controls.errorLabel, !g_screenState.errorText.empty());
     SetControlVisible(g_controls.licenseLabel, !g_screenState.licenseText.empty());
+    SetControlEnabled(g_controls.scanFilePathEdit, g_screenState.scanAvailable && !g_scanInProgress);
+    SetControlEnabled(g_controls.scanFileBrowseButton, g_screenState.scanAvailable && !g_scanInProgress);
+    SetControlEnabled(g_controls.scanFileButton, g_screenState.scanAvailable && !g_scanInProgress);
+    SetControlEnabled(g_controls.scanFixedDrivesButton, g_screenState.scanAvailable && !g_scanInProgress);
+    SetControlEnabled(g_controls.scanFolderButton, g_screenState.scanAvailable && !g_scanInProgress);
+    SetControlEnabled(g_controls.schedulePickFolderButton, g_screenState.scanAvailable);
+    SetControlEnabled(g_controls.scheduleIntervalEdit, g_screenState.scanAvailable);
+    SetControlEnabled(g_controls.scheduleEnableButton, g_screenState.scanAvailable);
+    SetControlEnabled(g_controls.scheduleDisableButton, g_screenState.scanAvailable);
+    SetControlEnabled(g_controls.monitoringAddButton, g_screenState.scanAvailable);
+    SetControlEnabled(g_controls.monitoringRemoveButton, g_screenState.scanAvailable);
 }
 
 void RefreshUiState() {
@@ -622,13 +1014,98 @@ void RefreshUiState() {
     }
 
     g_isRefreshingState = true;
+    const ScreenMode previousMode = g_screenState.mode;
     g_screenState = QueryScreenState();
+    if (g_screenState.mode != ScreenMode::Licensed && previousMode == ScreenMode::Licensed) {
+        g_scanSummaryText.clear();
+    }
     ApplyScreenState();
     g_isRefreshingState = false;
 }
 
 void ClearTransientErrorOnSuccess() {
     g_transientErrorMessage.clear();
+}
+
+DWORD WINAPI ScanWorkerThread(LPVOID parameter) {
+    std::unique_ptr<ScanRequestContext> request(static_cast<ScanRequestContext*>(parameter));
+    std::unique_ptr<ScanCompletedState> completed = std::make_unique<ScanCompletedState>();
+    completed->operation = request->operation;
+
+    switch (request->operation) {
+    case ScanOperation::File:
+        completed->rpcOk = ScanFileViaRpc(request->path, &completed->summary);
+        break;
+    case ScanOperation::Directory:
+        completed->rpcOk = ScanDirectoryViaRpc(request->path, &completed->summary);
+        break;
+    case ScanOperation::FixedDrives:
+        completed->rpcOk = ScanFixedDrivesViaRpc(&completed->summary);
+        break;
+    }
+
+    ScanCompletedState* completedRaw = completed.release();
+    if (!PostMessageW(request->window, kScanCompletedMessage, 0, reinterpret_cast<LPARAM>(completedRaw))) {
+        delete completedRaw;
+    }
+    return 0;
+}
+
+void StartAsyncScan(HWND window, ScanOperation operation, const std::wstring& path = L"") {
+    if (g_scanInProgress) {
+        g_transientErrorMessage = L"Another scan is already running.";
+        RefreshUiState();
+        return;
+    }
+
+    auto* request = new ScanRequestContext();
+    request->window = window;
+    request->operation = operation;
+    request->path = path;
+
+    HANDLE thread = CreateThread(nullptr, 0, ScanWorkerThread, request, 0, nullptr);
+    if (!thread) {
+        delete request;
+        g_transientErrorMessage = L"Unable to start the scan worker thread.";
+        RefreshUiState();
+        return;
+    }
+
+    CloseHandle(thread);
+    g_scanInProgress = true;
+    g_scanSummaryText = (operation == ScanOperation::FixedDrives)
+        ? L"Fixed drives scan is running in the background..."
+        : L"Scan is running in the background...";
+    ClearTransientErrorOnSuccess();
+    ApplyScreenState();
+}
+
+void HandleScanCompleted(HWND window, ScanCompletedState* completed) {
+    std::unique_ptr<ScanCompletedState> result(completed);
+    g_scanInProgress = false;
+
+    if (!result || !result->rpcOk) {
+        g_scanSummaryText = L"Unable to send the scan request.";
+        ApplyScreenState();
+        return;
+    }
+
+    g_scanSummaryText = result->summary.summary.empty()
+        ? L"No scan result was returned."
+        : result->summary.summary;
+
+    if (result->summary.resultCode == antivirus::kRpcResultNotAuthenticated ||
+        result->summary.resultCode == antivirus::kRpcResultLicenseRequired ||
+        result->summary.resultCode == antivirus::kRpcResultDatabaseUnavailable) {
+        RefreshUiState();
+        return;
+    }
+
+    if (result->summary.resultCode != antivirus::kRpcResultOk) {
+        g_transientErrorMessage = L"Scan finished with an error.";
+    }
+
+    ApplyScreenState();
 }
 
 void HandleLoginRequest() {
@@ -687,6 +1164,138 @@ void HandleLogoutRequest() {
         ClearTransientErrorOnSuccess();
         SetWindowTextW(g_controls.loginPasswordEdit, L"");
         SetWindowTextW(g_controls.activationEdit, L"");
+        g_scanSummaryText.clear();
+    }
+
+    RefreshUiState();
+}
+
+void HandleScanFileRequest(HWND owner) {
+    std::wstring path = GetEditText(g_controls.scanFilePathEdit);
+    if (path.empty()) {
+        path = ShowOpenFileDialog(owner);
+    }
+    if (path.empty()) {
+        return;
+    }
+
+    g_selectedScanFilePath = path;
+    StartAsyncScan(owner, ScanOperation::File, path);
+}
+
+void HandleBrowseScanFileRequest(HWND owner) {
+    const std::wstring path = ShowOpenFileDialog(owner);
+    if (path.empty()) {
+        return;
+    }
+
+    g_selectedScanFilePath = path;
+    SetWindowTextW(g_controls.scanFilePathEdit, g_selectedScanFilePath.c_str());
+}
+
+void HandleScanFolderRequest(HWND owner) {
+    const std::wstring path = ShowFolderDialog(owner);
+    if (path.empty()) {
+        return;
+    }
+    StartAsyncScan(owner, ScanOperation::Directory, path);
+}
+
+void HandleScanFixedDrivesRequest(HWND window) {
+    StartAsyncScan(window, ScanOperation::FixedDrives);
+}
+
+void HandlePickScheduleFolderRequest(HWND owner) {
+    const std::wstring path = ShowFolderDialog(owner);
+    if (path.empty()) {
+        return;
+    }
+
+    g_selectedScheduleFolder = path;
+    RefreshUiState();
+}
+
+long ReadScheduleIntervalSeconds() {
+    const std::wstring text = GetEditText(g_controls.scheduleIntervalEdit);
+    if (text.empty()) {
+        return 0;
+    }
+
+    try {
+        return std::stol(text);
+    } catch (...) {
+        return 0;
+    }
+}
+
+void HandleEnableScheduleRequest() {
+    const long intervalSeconds = ReadScheduleIntervalSeconds();
+    std::wstring message;
+    long resultCode = antivirus::kRpcResultUnexpectedResponse;
+
+    if (!ConfigureScheduledScanViaRpc(true, intervalSeconds, g_selectedScheduleFolder, &message, &resultCode)) {
+        g_transientErrorMessage = L"Unable to configure scheduled scanning.";
+    } else if (resultCode != antivirus::kRpcResultOk) {
+        g_transientErrorMessage = message.empty() ? L"Scheduled scanning could not be enabled." : message;
+    } else {
+        ClearTransientErrorOnSuccess();
+        g_scanSummaryText = message;
+    }
+
+    RefreshUiState();
+}
+
+void HandleDisableScheduleRequest() {
+    std::wstring message;
+    long resultCode = antivirus::kRpcResultUnexpectedResponse;
+
+    if (!ConfigureScheduledScanViaRpc(false, 0, L"", &message, &resultCode)) {
+        g_transientErrorMessage = L"Unable to disable scheduled scanning.";
+    } else if (resultCode != antivirus::kRpcResultOk) {
+        g_transientErrorMessage = message.empty() ? L"Scheduled scanning could not be disabled." : message;
+    } else {
+        ClearTransientErrorOnSuccess();
+        g_scanSummaryText = message;
+    }
+
+    RefreshUiState();
+}
+
+void HandleAddMonitorRequest(HWND owner) {
+    const std::wstring path = ShowFolderDialog(owner);
+    if (path.empty()) {
+        return;
+    }
+
+    std::wstring message;
+    long resultCode = antivirus::kRpcResultUnexpectedResponse;
+    if (!AddMonitoredDirectoryViaRpc(path, &message, &resultCode)) {
+        g_transientErrorMessage = L"Unable to add the monitored directory.";
+    } else if (resultCode != antivirus::kRpcResultOk) {
+        g_transientErrorMessage = message.empty() ? L"The monitored directory could not be added." : message;
+    } else {
+        ClearTransientErrorOnSuccess();
+        g_scanSummaryText = message;
+    }
+
+    RefreshUiState();
+}
+
+void HandleRemoveMonitorRequest(HWND owner) {
+    const std::wstring path = ShowFolderDialog(owner);
+    if (path.empty()) {
+        return;
+    }
+
+    std::wstring message;
+    long resultCode = antivirus::kRpcResultUnexpectedResponse;
+    if (!RemoveMonitoredDirectoryViaRpc(path, &message, &resultCode)) {
+        g_transientErrorMessage = L"Unable to remove the monitored directory.";
+    } else if (resultCode != antivirus::kRpcResultOk) {
+        g_transientErrorMessage = message.empty() ? L"The monitored directory could not be removed." : message;
+    } else {
+        ClearTransientErrorOnSuccess();
+        g_scanSummaryText = message;
     }
 
     RefreshUiState();
@@ -718,6 +1327,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             return 0;
         }
         break;
+
+    case kScanCompletedMessage:
+        HandleScanCompleted(window, reinterpret_cast<ScanCompletedState*>(lParam));
+        return 0;
 
     case antivirus::kTrayIconMessage:
         if (lParam == WM_LBUTTONDOWN) {
@@ -756,6 +1369,42 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
             HandleLogoutRequest();
             return 0;
 
+        case kScanFileButtonId:
+            HandleScanFileRequest(window);
+            return 0;
+
+        case kScanFileBrowseButtonId:
+            HandleBrowseScanFileRequest(window);
+            return 0;
+
+        case kScanFixedDrivesButtonId:
+            HandleScanFixedDrivesRequest(window);
+            return 0;
+
+        case kScanFolderButtonId:
+            HandleScanFolderRequest(window);
+            return 0;
+
+        case kSchedulePickFolderButtonId:
+            HandlePickScheduleFolderRequest(window);
+            return 0;
+
+        case kScheduleEnableButtonId:
+            HandleEnableScheduleRequest();
+            return 0;
+
+        case kScheduleDisableButtonId:
+            HandleDisableScheduleRequest();
+            return 0;
+
+        case kMonitoringAddButtonId:
+            HandleAddMonitorRequest(window);
+            return 0;
+
+        case kMonitoringRemoveButtonId:
+            HandleRemoveMonitorRequest(window);
+            return 0;
+
         }
         break;
 
@@ -790,8 +1439,8 @@ HWND CreateMainWindow(HINSTANCE instance) {
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        560,
-        420,
+        780,
+        760,
         nullptr,
         nullptr,
         instance,
