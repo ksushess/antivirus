@@ -23,4 +23,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: antivirus-binaries
-          path: build/Release/*.exe
+          path: |
+            build/Release/*.exe
+            build/Release/bases/*.avdb

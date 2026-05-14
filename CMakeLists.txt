@@ -83,6 +83,7 @@ target_link_libraries(antivirus PRIVATE
 )
 
 add_executable(antivirus_service
+    av_database_storage.cpp
     service.cpp
     rpc_client.cpp
     scan_engine.cpp
@@ -107,4 +108,9 @@ target_link_libraries(antivirus_service PRIVATE
     userenv
     winhttp
     wtsapi32
+)
+
+add_custom_command(TARGET antivirus_service POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "$<TARGET_FILE_DIR:antivirus_service>/bases"
+    COMMAND "$<TARGET_FILE:antivirus_service>" --export-default-bases "$<TARGET_FILE_DIR:antivirus_service>/bases/default.avdb"
 )

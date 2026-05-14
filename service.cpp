@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "antivirus_rpc.h"
+#include "av_database_storage.h"
 #include "rpc_client.h"
 #include "scan_engine.h"
 #include "shared.h"
@@ -60,6 +61,10 @@ DWORD g_statusCheckpoint = 1;
 
 std::wstring g_serviceDirectory;
 std::wstring g_trayApplicationPath;
+std::wstring g_basesDirectory;
+std::wstring g_defaultDatabasePath;
+std::wstring g_currentDatabasePath;
+std::wstring g_backupDatabasePath;
 
 std::mutex g_processMutex;
 std::map<DWORD, SessionProcess> g_sessionProcesses;
@@ -106,7 +111,7 @@ void StopAuthWorker();
 bool StartScheduleWorker();
 void StopScheduleWorker();
 void ClearLicenseStateLocked(long state, const std::wstring& message);
-bool EnsureAvDatabaseLoadedForActiveLicense(std::wstring* errorMessage);
+bool EnsureAvDatabaseLoaded(std::wstring* errorMessage);
 void StopAllMonitoring();
 long EnsureAntivirusReady(
     std::map<std::uint64_t, std::vector<antivirus::AvRecord>>* databaseSnapshot,
@@ -136,6 +141,11 @@ std::wstring QuoteForCommandLine(const std::wstring& path) {
 bool FileExists(const std::wstring& path) {
     const DWORD attributes = GetFileAttributesW(path.c_str());
     return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+bool DirectoryExists(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
 }
 
 std::wstring FormatMacAddress(const BYTE* address, ULONG length) {
@@ -221,35 +231,21 @@ void ClearAvDatabaseLocked() {
 }
 
 bool LoadAvDatabaseIntoMemory(std::wstring* errorMessage) {
+    antivirus::AvDatabaseLoadStats stats;
     std::map<std::uint64_t, std::vector<antivirus::AvRecord>> database;
-    antivirus::AvDatabaseInfo info;
-    if (!antivirus::BuildDemoAvDatabase(&database, &info, errorMessage)) {
+    if (!antivirus::LoadAvDatabaseFromFile(g_currentDatabasePath, &database, &stats, errorMessage)) {
         return false;
     }
 
     std::lock_guard<std::mutex> guard(g_authMutex);
-    if (!HasActiveLicenseLocked()) {
-        if (errorMessage && errorMessage->empty()) {
-            *errorMessage = L"Antivirus bases cannot be loaded without an active license.";
-        }
-        return false;
-    }
-
     g_avDatabase = std::move(database);
-    g_avDatabaseInfo = std::move(info);
+    g_avDatabaseInfo = std::move(stats.info);
     return true;
 }
 
-bool EnsureAvDatabaseLoadedForActiveLicense(std::wstring* errorMessage) {
+bool EnsureAvDatabaseLoaded(std::wstring* errorMessage) {
     {
         std::lock_guard<std::mutex> guard(g_authMutex);
-        if (!HasActiveLicenseLocked()) {
-            if (errorMessage && errorMessage->empty()) {
-                *errorMessage = L"An active license is required to load antivirus bases.";
-            }
-            return false;
-        }
-
         if (g_avDatabaseInfo.isLoaded && !g_avDatabase.empty()) {
             return true;
         }
@@ -258,17 +254,109 @@ bool EnsureAvDatabaseLoadedForActiveLicense(std::wstring* errorMessage) {
     return LoadAvDatabaseIntoMemory(errorMessage);
 }
 
-void PreloadAvDatabaseBestEffort() {
-    std::map<std::uint64_t, std::vector<antivirus::AvRecord>> database;
-    antivirus::AvDatabaseInfo info;
-    std::wstring ignoredError;
-    if (!antivirus::BuildDemoAvDatabase(&database, &info, &ignoredError)) {
-        return;
+bool CopyDatabaseFile(const std::wstring& sourcePath, const std::wstring& targetPath, std::wstring* errorMessage) {
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(targetPath).parent_path(), error);
+    error.clear();
+    std::filesystem::copy_file(
+        std::filesystem::path(sourcePath),
+        std::filesystem::path(targetPath),
+        std::filesystem::copy_options::overwrite_existing,
+        error
+    );
+    if (error) {
+        if (errorMessage) {
+            *errorMessage = L"Unable to copy the antivirus database file.";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool EnsureDefaultDatabaseExists(std::wstring* errorMessage) {
+    antivirus::AvDatabaseLoadStats stats;
+    std::map<std::uint64_t, std::vector<antivirus::AvRecord>> ignoredDatabase;
+    if (antivirus::LoadAvDatabaseFromFile(g_defaultDatabasePath, &ignoredDatabase, &stats, nullptr)) {
+        return true;
     }
 
-    std::lock_guard<std::mutex> guard(g_authMutex);
-    g_avDatabase = std::move(database);
-    g_avDatabaseInfo = std::move(info);
+    return antivirus::ExportBuiltInDefaultAvDatabase(g_defaultDatabasePath, errorMessage);
+}
+
+bool ExportDatabaseWithCorruptedRecord(const std::wstring& path, std::wstring* errorMessage) {
+    std::map<std::uint64_t, std::vector<antivirus::AvRecord>> database;
+    antivirus::AvDatabaseInfo info;
+    if (!antivirus::BuildDemoAvDatabase(&database, &info, errorMessage)) {
+        return false;
+    }
+
+    for (auto& [_, records] : database) {
+        for (antivirus::AvRecord& record : records) {
+            if (!record.avRecordSignature.empty()) {
+                record.avRecordSignature[0] ^= 0x5A;
+                return antivirus::SaveAvDatabaseToFile(path, database, info, errorMessage);
+            }
+        }
+    }
+
+    if (errorMessage) {
+        *errorMessage = L"Unable to find a record signature to corrupt.";
+    }
+    return false;
+}
+
+bool LoadAvDatabaseFromPreferredSource(std::wstring* errorMessage) {
+    if (!EnsureDefaultDatabaseExists(errorMessage)) {
+        return false;
+    }
+
+    auto storeLoadedDatabase = [](const std::map<std::uint64_t, std::vector<antivirus::AvRecord>>& database,
+                                  const antivirus::AvDatabaseLoadStats& stats) {
+        std::lock_guard<std::mutex> guard(g_authMutex);
+        g_avDatabase = database;
+        g_avDatabaseInfo = stats.info;
+    };
+
+    antivirus::AvDatabaseLoadStats stats;
+    std::map<std::uint64_t, std::vector<antivirus::AvRecord>> database;
+    if (FileExists(g_currentDatabasePath) &&
+        antivirus::LoadAvDatabaseFromFile(g_currentDatabasePath, &database, &stats, errorMessage)) {
+        if (!FileExists(g_backupDatabasePath)) {
+            CopyDatabaseFile(g_currentDatabasePath, g_backupDatabasePath, nullptr);
+        }
+        storeLoadedDatabase(database, stats);
+        return true;
+    }
+
+    std::wstring fallbackError;
+    antivirus::AvDatabaseLoadStats backupStats;
+    std::map<std::uint64_t, std::vector<antivirus::AvRecord>> backupDatabase;
+    if (FileExists(g_backupDatabasePath) &&
+        antivirus::LoadAvDatabaseFromFile(g_backupDatabasePath, &backupDatabase, &backupStats, &fallbackError)) {
+        if (!CopyDatabaseFile(g_backupDatabasePath, g_currentDatabasePath, nullptr) && errorMessage && errorMessage->empty()) {
+            *errorMessage = L"Antivirus bases were restored from backup, but current storage could not be refreshed.";
+        }
+        storeLoadedDatabase(backupDatabase, backupStats);
+        return true;
+    }
+
+    antivirus::AvDatabaseLoadStats defaultStats;
+    std::map<std::uint64_t, std::vector<antivirus::AvRecord>> defaultDatabase;
+    if (antivirus::LoadAvDatabaseFromFile(g_defaultDatabasePath, &defaultDatabase, &defaultStats, &fallbackError)) {
+        CopyDatabaseFile(g_defaultDatabasePath, g_currentDatabasePath, nullptr);
+        if (!FileExists(g_backupDatabasePath)) {
+            CopyDatabaseFile(g_defaultDatabasePath, g_backupDatabasePath, nullptr);
+        }
+        storeLoadedDatabase(defaultDatabase, defaultStats);
+        return true;
+    }
+
+    if (errorMessage && errorMessage->empty()) {
+        *errorMessage = fallbackError.empty()
+            ? L"Unable to load antivirus bases from current, backup, or default storage."
+            : fallbackError;
+    }
+    return false;
 }
 
 std::wstring FormatTimePoint(const std::chrono::system_clock::time_point& value) {
@@ -744,7 +832,7 @@ long RefreshLicenseStateFromBackend(bool forceRefresh) {
         }
         if (shouldLoadDatabase) {
             std::wstring ignoredError;
-            EnsureAvDatabaseLoadedForActiveLicense(&ignoredError);
+            EnsureAvDatabaseLoaded(&ignoredError);
         }
         return antivirus::kRpcResultOk;
     }
@@ -814,7 +902,7 @@ long ActivateLicenseViaBackend(const std::wstring& activationCode) {
 
         if (shouldLoadDatabase) {
             std::wstring databaseError;
-            if (!EnsureAvDatabaseLoadedForActiveLicense(&databaseError)) {
+            if (!EnsureAvDatabaseLoaded(&databaseError)) {
                 std::lock_guard<std::mutex> guard(g_authMutex);
                 if (g_accessToken == accessToken && g_licenseState == antivirus::kLicenseStateActive) {
                     g_licenseMessage = databaseError.empty()
@@ -1257,7 +1345,7 @@ long EnsureAntivirusReady(
     }
 
     std::wstring loadError;
-    if (!EnsureAvDatabaseLoadedForActiveLicense(&loadError)) {
+    if (!EnsureAvDatabaseLoaded(&loadError)) {
         if (message) {
             *message = loadError.empty() ? L"Antivirus bases are not loaded." : loadError;
         }
@@ -2138,6 +2226,10 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
 
     g_serviceDirectory = GetDirectoryName(GetModulePath());
     g_trayApplicationPath = g_serviceDirectory + L"\\" + antivirus::kTrayExecutableName;
+    g_basesDirectory = g_serviceDirectory + L"\\bases";
+    g_defaultDatabasePath = g_basesDirectory + L"\\default.avdb";
+    g_currentDatabasePath = g_basesDirectory + L"\\current.avdb";
+    g_backupDatabasePath = g_basesDirectory + L"\\backup.avdb";
     if (!FileExists(g_trayApplicationPath)) {
         UpdateServiceStatus(SERVICE_STOPPED, ERROR_FILE_NOT_FOUND);
         return;
@@ -2150,7 +2242,11 @@ void WINAPI ServiceMain(DWORD, LPWSTR*) {
         return;
     }
 
-    PreloadAvDatabaseBestEffort();
+    std::wstring databaseError;
+    if (!LoadAvDatabaseFromPreferredSource(&databaseError)) {
+        UpdateServiceStatus(SERVICE_STOPPED, ERROR_INVALID_DATA);
+        return;
+    }
 
     if (!StartAuthWorker()) {
         UpdateServiceStatus(SERVICE_STOPPED, GetLastError() != NO_ERROR ? GetLastError() : ERROR_SERVICE_SPECIFIC_ERROR);
@@ -2596,6 +2692,46 @@ int wmain(int argc, wchar_t* argv[]) {
 
             PrintLastErrorMessage(L"Service uninstall", GetLastError());
             return 1;
+        }
+
+        if (command == L"--export-default-bases") {
+            if (argc < 3) {
+                std::fwprintf(stderr, L"Usage: antivirus_service.exe --export-default-bases <path>\n");
+                return 1;
+            }
+
+            std::wstring errorMessage;
+            if (!antivirus::ExportBuiltInDefaultAvDatabase(argv[2], &errorMessage)) {
+                std::fwprintf(
+                    stderr,
+                    L"%ls\n",
+                    errorMessage.empty() ? L"Unable to export the built-in antivirus bases." : errorMessage.c_str()
+                );
+                return 1;
+            }
+
+            std::wprintf(L"Built-in antivirus bases exported successfully.\n");
+            return 0;
+        }
+
+        if (command == L"--export-bad-record-bases") {
+            if (argc < 3) {
+                std::fwprintf(stderr, L"Usage: antivirus_service.exe --export-bad-record-bases <path>\n");
+                return 1;
+            }
+
+            std::wstring errorMessage;
+            if (!ExportDatabaseWithCorruptedRecord(argv[2], &errorMessage)) {
+                std::fwprintf(
+                    stderr,
+                    L"%ls\n",
+                    errorMessage.empty() ? L"Unable to export the antivirus bases with a corrupted record." : errorMessage.c_str()
+                );
+                return 1;
+            }
+
+            std::wprintf(L"Antivirus bases with a corrupted record exported successfully.\n");
+            return 0;
         }
 
         if (command == L"--request-stop") {
